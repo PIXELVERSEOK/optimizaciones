@@ -1,0 +1,1401 @@
+No hay script que convierta una iGPU Intel UHD en una RTX. En tu **ASUS ExpertCenter PN64 / i3-1220P / 16 GB dual / NVMe**, CS2 va limitado por la **Intel UHD** y por temperatura/potencia del mini PC. La clave es: **720p o 1024x768, todo en bajo, FSR, Windows limpio, plan de energía y evitar throttling**. Aun así, te dejo un optimizador real, reversible y agresivo, estilo Ryzer Cortex, más la configuración exacta de CS2.
+
+> Haz copia de seguridad/punto de restauración. El script crea su propio backup. No desactives Defender, Windows Update ni servicios de red/audio/anticheat.
+
+---
+
+## 1. Script “CS2 Ultra Optimizer” para Windows
+
+Guarda esto como **`CS2-UltraOptimizer.ps1`**, abre **PowerShell como Administrador**, entra en la carpeta y ejecuta:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\CS2-UltraOptimizer.ps1 -Apply -CreateRestorePoint -Clean
+```
+
+Modo más agresivo, solo si aceptas que Windows Search/Notificaciones vayan peor:
+
+```powershell
+.\CS2-UltraOptimizer.ps1 -Apply -Aggressive -Clean
+```
+
+Para restaurar:
+
+```powershell
+.\CS2-UltraOptimizer.ps1 -Restore
+```
+
+### Script completo
+
+```powershell
+# ============================================================
+#  CS2 ULTRA OPTIMIZER v1.0
+#  Uso:
+#    Set-ExecutionPolicy Bypass -Scope Process -Force
+#    .\CS2-UltraOptimizer.ps1 -Apply -CreateRestorePoint -Clean
+#    .\CS2-UltraOptimizer.ps1 -Apply -Aggressive -Clean
+#    .\CS2-UltraOptimizer.ps1 -Restore
+# ============================================================
+#requires -Version 5.1
+#requires -RunAsAdministrator
+
+[CmdletBinding()]
+param(
+    [switch]$Apply,
+    [switch]$Restore,
+    [switch]$Aggressive,
+    [switch]$Clean,
+    [switch]$CreateRestorePoint,
+    [string]$BackupPath
+)
+
+$ErrorActionPreference = "SilentlyContinue"
+$root = "C:\ProgramData\CS2UltraOptimizer"
+$lastBackupFile = Join-Path $root "last_backup.txt"
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+function Write-Log([string]$msg) {
+    Write-Host "[CS2-Ultra] $msg" -ForegroundColor Cyan
+    if ($backupDir) {
+        Add-Content -Path (Join-Path $backupDir "optimizer.log") `
+            -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg"
+    }
+}
+
+function Set-RegDword([string]$path, [string]$name, [int]$value) {
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    New-ItemProperty -Path $path -Name $name -Value $value `
+        -PropertyType DWord -Force | Out-Null
+}
+
+function Set-RegString([string]$path, [string]$name, [string]$value) {
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    New-ItemProperty -Path $path -Name $name -Value $value `
+        -PropertyType String -Force | Out-Null
+}
+
+function Get-CS2Dirs {
+    $dirs = @()
+    $steam = (Get-ItemProperty "HKCU:\Software\Valve\Steam" `
+        -Name SteamPath -ErrorAction SilentlyContinue).SteamPath
+
+    if ($steam) {
+        $steam = $steam -replace '/','\'
+        $dirs += Join-Path $steam "steamapps\common\Counter-Strike Global Offensive"
+
+        $vdf = Join-Path $steam "steamapps\libraryfolders.vdf"
+        if (Test-Path $vdf) {
+            $txt = Get-Content $vdf -Raw -ErrorAction SilentlyContinue
+            [regex]::Matches($txt, '"path"\s+"([^"]+)"') | ForEach-Object {
+                $lib = $_.Groups[1].Value -replace '\\\\','\'
+                $dirs += Join-Path $lib "steamapps\common\Counter-Strike Global Offensive"
+            }
+        }
+    }
+
+    $dirs | Where-Object { $_ } | Sort-Object -Unique
+}
+
+function Backup-CurrentState {
+    param($dir)
+
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+    $keys = @(
+        "HKCU\System\GameConfigStore",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR",
+        "HKCU\Software\Microsoft\GameBar",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+        "HKCU\Control Panel\Desktop",
+        "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
+        "HKCU\Software\Microsoft\DirectX\UserGpuPreferences",
+        "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+        "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+        "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
+    )
+
+    foreach ($k in $keys) {
+        $file = Join-Path $dir (($k -replace '[\\:]','_') + ".reg")
+        reg export "$k" "$file" /y | Out-Null
+    }
+
+    Get-Service |
+        Select-Object Name,StartType |
+        Export-Csv (Join-Path $dir "services.csv") -NoTypeInformation -Encoding UTF8
+
+    (powercfg /getactivescheme) |
+        Out-File (Join-Path $dir "power_plan.txt") -Encoding UTF8
+
+    Get-CimInstance Win32_PhysicalMemory |
+        Select Manufacturer,PartNumber,Capacity,Speed,ConfiguredClockSpeed,DeviceLocator |
+        Export-Csv (Join-Path $dir "ram.csv") -NoTypeInformation -Encoding UTF8
+
+    Get-CimInstance Win32_StartupCommand |
+        Select Name,Command,Location |
+        Export-Csv (Join-Path $dir "startup.csv") -NoTypeInformation -Encoding UTF8
+}
+
+function Apply-Optimizer {
+    if ($CreateRestorePoint) {
+        try {
+            Enable-ComputerRestore -Drive "$env:SystemDrive\"
+            Checkpoint-Computer -Description "CS2 Ultra Optimizer" `
+                -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+            Write-Log "Punto de restauración creado."
+        } catch {
+            Write-Log "No se pudo crear punto de restauración: $_"
+        }
+    }
+
+    $script:backupDir = Join-Path $root ("Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    Backup-CurrentState -dir $script:backupDir
+    Set-Content -Path $lastBackupFile -Value $script:backupDir -Encoding UTF8
+    Write-Log "Backup creado en $script:backupDir"
+
+    # ---------------- ENERGÍA ----------------
+    powercfg /setactive SCHEME_MIN | Out-Null
+
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PERFBOOSTMODE 2
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR CPMINCORES 100
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR CPMAXCORES 100
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PCIEXPRESS ASPM 0
+    powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 0
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 0
+    powercfg /setactive SCHEME_CURRENT
+    Write-Log "Plan de energía, core parking y PCIe ajustados."
+
+    # ---------------- REGISTRO ----------------
+    Set-RegDword "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+    Set-RegDword "HKCU:\System\GameConfigStore" "GameDVR_FSEBehavior" 2
+    Set-RegDword "HKCU:\System\GameConfigStore" "GameDVR_HonorUserFSEBehaviorMode" 1
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 0
+    Set-RegDword "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" 1
+    Set-RegDword "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 1
+    Set-RegDword "HKCU:\Software\Microsoft\GameBar" "UseNexusForGameBarEnabled" 0
+
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" 2
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 0
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 1
+    Set-RegString "HKCU:\Control Panel\Desktop" "MenuShowDelay" "0"
+
+    Set-RegDword "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
+    Set-RegDword "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" -1
+
+    $games = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+    Set-RegDword $games "GPU Priority" 8
+    Set-RegDword $games "Priority" 6
+    Set-RegString $games "Scheduling Category" "High"
+    Set-RegString $games "SFIO Priority" "High"
+
+    Set-RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "ClearPageFileAtShutdown" 0
+    Set-RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 1
+
+    Set-RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0
+    Write-Log "Registro, GameDVR, Game Mode y MMCSS ajustados."
+
+    # ---------------- SERVICIOS ----------------
+    $svcMap = @{
+        "DiagTrack"          = "Disabled"
+        "dmwappushservice"   = "Disabled"
+        "MapsBroker"         = "Disabled"
+        "RetailDemo"         = "Disabled"
+        "RemoteRegistry"     = "Disabled"
+        "XblAuthManager"     = "Manual"
+        "XblGameSave"        = "Manual"
+        "XboxNetApiSvc"      = "Manual"
+        "XboxGipSvc"         = "Manual"
+        "BcastDVRUserService"= "Manual"
+    }
+
+    if ($Aggressive) {
+        $svcMap["WSearch"] = "Disabled"
+        $svcMap["SysMain"] = "Disabled"
+    }
+
+    foreach ($s in $svcMap.Keys) {
+        if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
+            Set-Service -Name $s -StartupType $svcMap[$s] -ErrorAction SilentlyContinue
+            Write-Log "Servicio $s -> $($svcMap[$s])"
+        }
+    }
+
+    # ---------------- CS2 ----------------
+    $layerKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+    $gpuKey   = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+    if (-not (Test-Path $layerKey)) { New-Item -Path $layerKey -Force | Out-Null }
+    if (-not (Test-Path $gpuKey))   { New-Item -Path $gpuKey   -Force | Out-Null }
+
+    foreach ($dir in Get-CS2Dirs) {
+        $exe = Join-Path $dir "game\bin\win64\cs2.exe"
+        if (Test-Path $exe) {
+            Set-ItemProperty -Path $layerKey -Name $exe `
+                -Value "~ DISABLEDXMAXIMIZEDWINDOWEDMODE" -Type String -Force
+
+            Set-ItemProperty -Path $gpuKey -Name $exe `
+                -Value "GpuPreference=2;" -Type String -Force
+
+            Add-MpPreference -ExclusionPath $dir -ErrorAction SilentlyContinue
+
+            Write-Log "CS2 optimizado: $exe"
+        }
+    }
+
+    # ---------------- LIMPIEZA ----------------
+    if ($Clean) {
+        $temps = @(
+            $env:TEMP,
+            "$env:WINDIR\Temp",
+            "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"
+        )
+
+        foreach ($t in $temps) {
+            Get-ChildItem -LiteralPath $t -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log "Temporales limpiados."
+    }
+
+    Write-Log "Optimización aplicada. Reinicia antes de jugar."
+}
+
+function Restore-Optimizer {
+    $script:backupDir = if ($BackupPath) {
+        $BackupPath
+    } else {
+        (Get-Content $lastBackupFile -Raw -ErrorAction SilentlyContinue).Trim()
+    }
+
+    if (-not $script:backupDir -or -not (Test-Path $script:backupDir)) {
+        Write-Host "No se encontró backup. Indica -BackupPath." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "Restaurando desde $script:backupDir" -ForegroundColor Yellow
+
+    # Servicios
+    $svcCsv = Join-Path $script:backupDir "services.csv"
+    if (Test-Path $svcCsv) {
+        Import-Csv $svcCsv | ForEach-Object {
+            $name  = $_.Name
+            $start = $_.StartType
+            if ($start -in @("Automatic","Manual","Disabled")) {
+                Set-Service -Name $name -StartupType $start -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Quitar entradas de CS2 añadidas
+    $layerKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+    $gpuKey   = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+
+    if (Test-Path $layerKey) {
+        (Get-Item $layerKey).Property |
+            Where-Object { $_ -like "*cs2.exe" } |
+            ForEach-Object {
+                Remove-ItemProperty -Path $layerKey -Name $_ -ErrorAction SilentlyContinue
+            }
+    }
+
+    if (Test-Path $gpuKey) {
+        (Get-Item $gpuKey).Property |
+            Where-Object { $_ -like "*cs2.exe" } |
+            ForEach-Object {
+                Remove-ItemProperty -Path $gpuKey -Name $_ -ErrorAction SilentlyContinue
+            }
+    }
+
+    # Importar backups de registro
+    Get-ChildItem $script:backupDir -Filter "*.reg" | ForEach-Object {
+        reg import "$($_.FullName)" | Out-Null
+    }
+
+    # Valores de seguridad por defecto
+    Set-RegDword "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 20
+    Set-RegDword "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 10
+    Set-RegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 0
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" 0
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 1
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 0
+    Set-RegDword "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 1
+    Set-RegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 1
+
+    # Plan de energía
+    $pp = Join-Path $script:backupDir "power_plan.txt"
+    $powerGuid = $null
+    if (Test-Path $pp) {
+        $line = Get-Content $pp -Raw
+        if ($line -match '([a-f0-9-]{36})') { $powerGuid = $matches[1] }
+    }
+
+    if ($powerGuid) {
+        powercfg /setactive $powerGuid | Out-Null
+    } else {
+        powercfg /setactive SCHEME_BALANCED | Out-Null
+    }
+
+    # Quitar exclusiones Defender de CS2
+    foreach ($dir in Get-CS2Dirs) {
+        if (Test-Path $dir) {
+            Remove-MpPreference -ExclusionPath $dir -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Host "Restauración completada. Reinicia el equipo." -ForegroundColor Green
+}
+
+if ($Apply -and $Restore) {
+    Write-Host "Usa -Apply o -Restore, no ambos." -ForegroundColor Red
+    exit 1
+}
+
+if (-not $Apply -and -not $Restore) {
+    Write-Host @"
+Uso:
+  .\CS2-UltraOptimizer.ps1 -Apply -CreateRestorePoint -Clean
+  .\CS2-UltraOptimizer.ps1 -Apply -Aggressive -Clean
+  .\CS2-UltraOptimizer.ps1 -Restore
+
+Notas:
+  -Aggressive añade desactivar WSearch y SysMain. Puede afectar búsqueda/precarga.
+  -Clean limpia temporales.
+  Requiere PowerShell como Administrador.
+"@ -ForegroundColor Yellow
+    exit 0
+}
+
+if ($Apply)   { Apply-Optimizer }
+if ($Restore) { Restore-Optimizer }
+```
+
+---
+
+## 2. Configuración exacta de CS2 para máxima FPS
+
+### Steam → CS2 → Propiedades → Opciones de lanzamiento
+
+Usa algo así, ajustando resolución/refresco a tu monitor:
+
+```text
+-novid -high -dx11 -fullscreen -w 1280 -h 720 -refresh 75
+```
+
+Si quieres el máximo absoluto de FPS:
+
+```text
+-novid -high -dx11 -fullscreen -w 1024 -h 768 -refresh 75
+```
+
+Notas:
+- `-high` puede ayudar, pero si notas stutter quítalo.
+- No uses `-threads`; CS2 gestiona los hilos solo.
+- No uses trucos raros de `-allow_third_party_software` salvo que sea necesario.
+- Si tu monitor es 60 Hz, cambia `-refresh 60`; si es 120/144, usa el máximo real.
+
+### Ajustes de vídeo dentro de CS2
+
+**Vídeo / Display**
+- Modo de pantalla: **Pantalla completa**
+- Resolución: **1280x720** o **1024x768** si aceptas 4:3 estirado
+- V-Sync: **Desactivado**
+- FSR / FidelityFX Super Resolution: **Performance** si existe en tu versión. Si ves demasiado borroso, **Balanced**.
+- Modo de baja latencia: lo que permita (en Intel no habrá Reflex)
+
+**Opciones avanzadas**
+- Global Shadow Quality: **Low**
+- Model / Texture Detail: **Low**
+- Texture Filtering: **Bilinear / 2x**
+- Shader Detail: **Low**
+- Particle Detail: **Low**
+- Ambient Occlusion: **Disabled**
+- High Dynamic Range: **Performance**
+- Multicore Rendering: **Enabled**
+- Boost Player Contrast: **Disabled** si buscas FPS puro; actívalo solo si te importa más ver enemigos
+- MSAA: **Disabled**
+- CMAA: **Disabled**
+- FSR: **Performance** para máximo FPS
+- Dynamic Resolution: **Off**
+- Texture Streaming: **Off** si existe y la VRAM compartida va justa
+
+### Consola / `autoexec.cfg`
+
+Con CS2 cerrado, crea/edita:
+
+`...\Counter-Strike Global Offensive\game\csgo\cfg\autoexec.cfg`
+
+```cfg
+// CS2 Ultra FPS - iGPU Intel
+fps_max 0
+engine_no_focus_sleep 0
+```
+
+Puedes poner `fps_max 60` o `fps_max 75` si tu mini PC se calienta demasiado. Para latencia pura, `fps_max 0`; para temperaturas estables, limita al refresco de tu monitor.
+
+En consola para medir:
+
+```cfg
+cl_showfps 1
+```
+
+---
+
+## 3. Optimización manual de Windows y ASUS
+
+### ASUS / BIOS
+1. Actualiza BIOS, chipset, Intel Graphics, Intel Wi-Fi/Ethernet desde **MyASUS**.
+2. En BIOS, si aparece:
+   - `Performance Mode` / `Turbo Mode`: elige el modo de máximo rendimiento.
+   - `XMP` o `Memory Profile`: actívalo si tu RAM lo soporta y es estable.
+   - Ventilador: modo **Performance** si existe.
+3. Deja el mini PC ventilado, levantado o con base externa. En un PN64 el throttling térmico es el mayor enemigo.
+4. No desmontes si está en garantía salvo que sepas lo que haces. Si las temperaturas pasan de 90 °C de forma sostenida, limita FPS a 60/75.
+
+### Windows
+1. **Configuración → Juegos → Modo de juego:** Activado.
+2. **Capturas de juego / Game Bar:** Desactivado.
+3. **Configuración → Sistema → Pantalla → Gráficos:** añade `cs2.exe` y pon **Alto rendimiento**.
+4. **Panel de control → Energía:** Alto rendimiento. El script ya lo toca.
+5. **Panel de control Intel Graphics Command Center:**
+   - Modo de rendimiento / rendimiento máximo.
+   - Desactiva mejoras visuales, antialiasing, filtros y escalado adicional.
+6. Cierra antes de jugar:
+   - Chrome/Edge con muchas pestañas
+   - Discord con overlay
+   - OneDrive
+   - Teams
+   - ASUS Armoury/MyASUS en segundo plano
+   - RGB/Razer/iCUE
+   - Programas de grabación
+7. Usa Ethernet, no Wi-Fi, para estabilidad online. No da más FPS, pero evita picos de latencia.
+
+### Steam
+- Desactiva **Steam Overlay** para CS2.
+- Descarga/reinstala el juego en el NVMe con al menos 20% libre.
+- Verifica integridad de archivos.
+- No uses “limpiadores de RAM”, “desfragmentadores de SSD” ni “optimizadores de registro” de terceros.
+
+---
+
+## 4. Ajuste fino real con benchmark
+
+1. Instala **HWiNFO64** y monitoriza:
+   - Temperatura CPU/GPU
+   - Frecuencia CPU/GPU
+   - Throttling
+   - Uso de iGPU
+2. Entra en CS2, mapa offline, y mide 10–15 minutos.
+3. Prueba esta secuencia cambiando **una sola cosa**:
+   - 1280x720 vs 1024x768
+   - FSR Balanced vs Performance
+   - `fps_max 0` vs `fps_max 60/75/120`
+   - HAGS activado vs desactivado: `Configuración → Sistema → Pantalla → Gráficos → Cambiar configuración de gráficos predeterminada`.
+   - `-high` en opciones de lanzamiento sí/no.
+4. Si las temperaturas suben de 85–90 °C, baja resolución o limita FPS. Un mini PC con throttling da menos FPS estables que uno con 60 fps bien refrigerado.
+
+---
+
+## 5. Qué NO haría
+
+- No desactives Defender, Windows Update, servicios de red/audio/anticheat ni el pagefile.
+- No uses “RAM cleaners”, “game boosters” de pago ni limpiadores de registry agresivos.
+- No desactives VBS/Core Isolation/Memory Integrity en un PC diario. Ganas muy poco y pierdes seguridad.
+- No pongas CS2 en prioridad **Realtime**; puede congelar el sistema. `-high` es suficiente.
+- No uses `-threads` ni cvars antiguas de CS:GO; muchas ya no existen en CS2 o no son legales.
+- No toques `bcdedit`, HPET o “timer resolution” sin saber. En Windows 11 moderno suele empeorar la estabilidad.
+
+---
+
+## Resumen práctico para tu PN64
+
+1. Actualiza BIOS/Intel Graphics/Windows.
+2. Ejecuta el script con `-Apply -CreateRestorePoint -Clean`.
+3. Reinicia.
+4. CS2 en **1280x720, Fullscreen, todo Low, FSR Performance, V-Sync off, sombras Low, MSAA off**.
+5. Launch options: `-novid -high -dx11 -fullscreen -w 1280 -h 720 -refresh 75`.
+6. Cierra todo en segundo plano y vigila temperaturas.
+7. Si hay throttling, limita a 60/75 FPS; jugarás más fluido y estable que con picos de 80 y bajones a 45.
+
+Con ese hardware, el objetivo realista no es “300 fps”, sino **aprovechar al máximo la iGPU, mantener mínimos estables y evitar que el mini PC entre en thermal throttling**.
+
+Vale. Te dejo la **v2.0 “Max Performance”**, más agresiva que la anterior y con modo **Extreme**, backup real, restauración, debloat opcional, tareas programadas, watchdog de prioridad para CS2, tweaks de iGPU/Intel, energía, memoria, red opcional y HAGS opcional.
+
+> **Importante:** en un PN64 con i3-1220P e Intel UHD, el límite real es la iGPU y el throttling térmico. Esto maximiza lo que hay, pero no convierte el mini PC en una RTX. Si notas temperaturas altas, limita FPS o baja a `-Mode Aggressive`.  
+> No desactives Defender, Firewall, Windows Update, VAC ni el pagefile. El script **no lo hace**. La exclusión de Defender para CS2 es opcional y solo si la pides.
+
+---
+
+## 1. Script `CS2-MaxPerformance-v2.ps1`
+
+Reemplaza al anterior. Guárdalo con ese nombre, abre **PowerShell como Administrador**, entra en la carpeta y ejecuta los comandos de la sección 2.
+
+```powershell
+# ============================================================
+#  CS2 MAX PERFORMANCE v2.0 - AGGRESSIVE / EXTREME
+#  Para ASUS ExpertCenter PN64 / i3-1220P / Intel UHD
+#  Uso:
+#    .\CS2-MaxPerformance-v2.ps1 -Apply -Mode Aggressive -CreateRestorePoint -Clean
+#    .\CS2-MaxPerformance-v2.ps1 -Apply -Mode Extreme -CreateRestorePoint -Clean -Debloat -NetworkTweaks -InstallWatchTask
+#    .\CS2-MaxPerformance-v2.ps1 -Restore
+#    .\CS2-MaxPerformance-v2.ps1 -InstallWatchTask
+#    .\CS2-MaxPerformance-v2.ps1 -UninstallWatchTask
+# ============================================================
+#requires -Version 5.1
+#requires -RunAsAdministrator
+
+[CmdletBinding()]
+param(
+    [ValidateSet("Balanced","Aggressive","Extreme")]
+    [string]$Mode = "Aggressive",
+
+    [switch]$Apply,
+    [switch]$Restore,
+    [switch]$CreateRestorePoint,
+    [switch]$Clean,
+    [switch]$Debloat,
+    [switch]$NetworkTweaks,
+    [switch]$DefenderExclusion,
+
+    [switch]$Hags,
+    [switch]$NoHags,
+
+    [switch]$DisableHVCI,
+    [switch]$IUnderstandRisks,
+
+    [switch]$InstallWatchTask,
+    [switch]$UninstallWatchTask,
+
+    [string]$BackupPath
+)
+
+$ErrorActionPreference = "SilentlyContinue"
+$root = "C:\ProgramData\CS2MaxPerformance"
+$logFile = Join-Path $root "cs2-max.log"
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$script:backupDir = $null
+
+function Write-Step {
+    param(
+        [string]$Message,
+        [string]$Type = "INFO"
+    )
+    $color = switch ($Type) {
+        "OK"   { "Green" }
+        "WARN" { "Yellow" }
+        "ERR"  { "Red" }
+        default { "Cyan" }
+    }
+    $line = "[$(Get-Date -Format 'HH:mm:ss')][$Type] $Message"
+    Write-Host $line -ForegroundColor $color
+    Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
+}
+
+function Set-Reg {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$false)]$Value,
+        [ValidateSet("DWord","String","QWord","Binary","ExpandString","MultiString")]
+        [string]$Type = "DWord"
+    )
+    if (-not (Test-Path $Path)) {
+        New-Item -Path $Path -Force | Out-Null
+    }
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+}
+
+function Get-CS2Exes {
+    $exes = @()
+    $steam = (Get-ItemProperty "HKCU:\Software\Valve\Steam" -Name SteamPath -ErrorAction SilentlyContinue).SteamPath
+
+    if ($steam) {
+        $steam = $steam -replace '/','\'
+        $candidates = @()
+        $candidates += Join-Path $steam "steamapps\common\Counter-Strike Global Offensive"
+
+        $vdf = Join-Path $steam "steamapps\libraryfolders.vdf"
+        if (Test-Path $vdf) {
+            $txt = Get-Content $vdf -Raw -ErrorAction SilentlyContinue
+            [regex]::Matches($txt, '"path"\s+"([^"]+)"') | ForEach-Object {
+                $lib = $_.Groups[1].Value -replace '\\\\','\'
+                $candidates += Join-Path $lib "steamapps\common\Counter-Strike Global Offensive"
+            }
+        }
+
+        foreach ($c in ($candidates | Sort-Object -Unique)) {
+            $exe = Join-Path $c "game\bin\win64\cs2.exe"
+            if (Test-Path $exe) {
+                $exes += $exe
+            }
+        }
+    }
+
+    $exes | Sort-Object -Unique
+}
+
+function Backup-State {
+    param([string]$Dir)
+
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    Write-Step "Creando backup en $Dir"
+
+    $keys = @(
+        "HKCU\System\GameConfigStore",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR",
+        "HKCU\Software\Microsoft\GameBar",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+        "HKCU\Control Panel\Desktop",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Search",
+        "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
+        "HKCU\Software\Microsoft\DirectX\UserGpuPreferences",
+        "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+        "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
+        "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR",
+        "HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched",
+        "HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
+        "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+        "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power",
+        "HKLM\SYSTEM\CurrentControlSet\Control\Power",
+        "HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling",
+        "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
+        "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard",
+        "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+        "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+        "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+    )
+
+    foreach ($k in $keys) {
+        $safe = ($k -replace '[\\/:*?"<>|]','_')
+        $file = Join-Path $Dir "$safe.reg"
+        reg export "$k" "$file" /y | Out-Null
+    }
+
+    Get-Service | Select-Object Name,DisplayName,StartType,Status |
+        Export-Csv (Join-Path $Dir 'services.csv') -NoTypeInformation -Encoding UTF8
+
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        Get-ScheduledTask | Select-Object TaskPath,TaskName,State |
+            Export-Csv (Join-Path $Dir 'scheduled_tasks.csv') -NoTypeInformation -Encoding UTF8
+    }
+
+    Get-CimInstance Win32_StartupCommand |
+        Select-Object Name,Command,Location,User |
+        Export-Csv (Join-Path $Dir 'startup.csv') -NoTypeInformation -Encoding UTF8
+
+    powercfg /getactivescheme | Out-File (Join-Path $Dir 'power_plan.txt') -Encoding UTF8
+    bcdedit /enum "{current}" | Out-File (Join-Path $Dir 'bcdedit.txt') -Encoding UTF8
+    Get-AppxPackage | Select-Object Name,PackageFullName |
+        Export-Csv (Join-Path $Dir 'appx.csv') -NoTypeInformation -Encoding UTF8
+
+    Get-CimInstance Win32_PhysicalMemory |
+        Select-Object Manufacturer,PartNumber,Capacity,Speed,ConfiguredClockSpeed,DeviceLocator |
+        Export-Csv (Join-Path $Dir 'ram.csv') -NoTypeInformation -Encoding UTF8
+
+    Get-CimInstance Win32_Processor |
+        Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed |
+        Export-Csv (Join-Path $Dir 'cpu.csv') -NoTypeInformation -Encoding UTF8
+
+    Get-CimInstance Win32_VideoController |
+        Select-Object Name,DriverVersion,VideoProcessor,AdapterRAM |
+        Export-Csv (Join-Path $Dir 'gpu.csv') -NoTypeInformation -Encoding UTF8
+
+    Get-CS2Exes | Out-File (Join-Path $Dir 'cs2_exes.txt') -Encoding UTF8
+}
+
+function New-OptimizerRestorePoint {
+    try {
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description "CS2 Max Performance v2" `
+            -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+        Write-Step "Punto de restauración creado." "OK"
+    } catch {
+        Write-Step "No se pudo crear punto de restauración: $_" "WARN"
+    }
+}
+
+function Install-WatchTask {
+    $watchScript = Join-Path $root 'CS2-Watchdog.ps1'
+
+    $content = @'
+$ErrorActionPreference = "SilentlyContinue"
+while ($true) {
+    $procs = Get-Process -Name cs2 -ErrorAction SilentlyContinue
+    foreach ($p in $procs) {
+        try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High } catch {}
+    }
+    Start-Sleep -Seconds 5
+}
+'@
+
+    $content | Set-Content -Path $watchScript -Encoding UTF8
+
+    $taskName = 'CS2 Max Performance Watchdog'
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+
+    Register-ScheduledTask -TaskName $taskName -Action $action `
+        -Trigger $trigger -Principal $principal -Force | Out-Null
+
+    Write-Step "Watchdog instalado: cs2.exe en prioridad High." "OK"
+}
+
+function Uninstall-WatchTask {
+    $taskName = 'CS2 Max Performance Watchdog'
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        Write-Step "Watchdog eliminado." "OK"
+    }
+
+    $watchScript = Join-Path $root 'CS2-Watchdog.ps1'
+    if (Test-Path $watchScript) {
+        Remove-Item $watchScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Apply-Optimizer {
+    if ($DisableHVCI -and -not $IUnderstandRisks) {
+        Write-Step "Para desactivar HVCI/VBS debes añadir -IUnderstandRisks. Abortando." "ERR"
+        return
+    }
+
+    if ($Hags -and $NoHags) {
+        Write-Step "No uses -Hags y -NoHags a la vez." "ERR"
+        return
+    }
+
+    if ($CreateRestorePoint) {
+        New-OptimizerRestorePoint
+    }
+
+    $script:backupDir = Join-Path $root ("Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    Backup-State -Dir $script:backupDir
+    Set-Content -Path (Join-Path $root 'last_backup.txt') `
+        -Value $script:backupDir -Encoding UTF8
+
+    # ================== ENERGÍA ==================
+    Write-Step "Aplicando plan Ultimate Performance y desbloqueo de CPU/GPU..."
+
+    $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+    $scheme = $null
+    $out = powercfg -duplicatescheme $ultimate 2>$null
+    if ($out -match '([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})') {
+        $scheme = $matches[1]
+    } else {
+        $scheme = 'SCHEME_MIN'
+    }
+
+    powercfg /setactive $scheme | Out-Null
+
+    $proc = @(
+        @('PERFBOOSTMODE', 2),
+        @('PROCTHROTTLEMIN', 100),
+        @('PROCTHROTTLEMAX', 100),
+        @('CPMINCORES', 100),
+        @('CPMAXCORES', 100),
+        @('PERFEPP', 0)
+    )
+
+    if ($Mode -eq 'Extreme') {
+        $proc += ,@('IDLEDISABLE', 1)
+    }
+
+    foreach ($p in $proc) {
+        powercfg /setacvalueindex $scheme SUB_PROCESSOR $p[0] $p[1] | Out-Null
+    }
+
+    powercfg /setacvalueindex $scheme SUB_PCIEXPRESS ASPM 0 | Out-Null
+    powercfg /setacvalueindex $scheme SUB_DISK DISKIDLE 0 | Out-Null
+    powercfg /setacvalueindex $scheme SUB_SLEEP STANDBYIDLE 0 | Out-Null
+    powercfg /setacvalueindex $scheme SUB_SLEEP HIBERNATEIDLE 0 | Out-Null
+    powercfg /setacvalueindex $scheme SUB_VIDEO VIDEOIDLE 0 | Out-Null
+    powercfg /setacvalueindex $scheme 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 | Out-Null
+    powercfg /setactive $scheme | Out-Null
+
+    if ($Mode -eq 'Extreme') {
+        powercfg /h off | Out-Null
+        Write-Step "Hibernación off y C-States limitados. Vigila temperaturas." "WARN"
+    }
+
+    # ================== REGISTRO ==================
+    Write-Step "Aplicando tweaks de registro, GameDVR, Game Mode y MMCSS..."
+
+    # GameDVR / Game Bar
+    Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+    Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_FSEBehavior" 2
+    Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_FSEBehaviorMode" 2
+    Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_HonorUserFSEBehaviorMode" 1
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AudioCaptureEnabled" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "CursorCaptureEnabled" 0
+    Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+
+    # Game Mode
+    Set-Reg "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" 1
+    Set-Reg "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 1
+    Set-Reg "HKCU:\Software\Microsoft\GameBar" "UseNexusForGameBarEnabled" 0
+    Set-Reg "HKCU:\Software\Microsoft\GameBar" "ShowStartupPanel" 0
+
+    # Visual / UI
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" 2
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 1
+    Set-Reg "HKCU:\Control Panel\Desktop" "MenuShowDelay" "0" -Type String
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ListviewAlphaSelect" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ListviewShadow" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
+    Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "CortanaConsent" 0
+
+    # Sistema / MMCSS / memoria
+    $sysResp = if ($Mode -eq 'Balanced') { 20 } else { 0 }
+
+    Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" $sysResp
+    Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" -1
+
+    $games = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+    Set-Reg $games "GPU Priority" 8
+    Set-Reg $games "Priority" 6
+    Set-Reg $games "Scheduling Category" "High" -Type String
+    Set-Reg $games "SFIO Priority" "High" -Type String
+
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 38
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 1
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "ClearPageFileAtShutdown" 0
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" "PowerThrottlingOff" 1
+
+    # HAGS opcional
+    if ($Hags) {
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 2
+        Write-Step "HAGS activado. Requiere reinicio." "OK"
+    }
+    if ($NoHags) {
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 1
+        Write-Step "HAGS desactivado. Requiere reinicio." "OK"
+    }
+
+    # ================== CS2 / iGPU ==================
+    Write-Step "Detectando CS2 y configurando iGPU / compatibilidad..."
+
+    $gpuKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+    $layerKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+    $cs2 = Get-CS2Exes
+
+    if (-not $cs2) {
+        Write-Step "No se encontró cs2.exe. Aplica los tweaks de CS2 manualmente." "WARN"
+    }
+
+    foreach ($exe in $cs2) {
+        Set-Reg $gpuKey $exe "GpuPreference=2;" -Type String
+        Set-Reg $layerKey $exe "~ DISABLEDXMAXIMIZEDWINDOWEDMODE" -Type String
+
+        if ($DefenderExclusion) {
+            Add-MpPreference -ExclusionPath $exe -ErrorAction SilentlyContinue
+            Write-Step "Exclusión Defender añadida: $exe" "WARN"
+        }
+
+        Write-Step "CS2 detectado y optimizado: $exe" "OK"
+    }
+
+    # ================== RED OPCIONAL ==================
+    if ($NetworkTweaks) {
+        Write-Step "Aplicando tweaks de red agresivos..." "WARN"
+
+        Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched" "NonBestEffortLimit" 0
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" "TcpAckFrequency" 1
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" "TCPNoDelay" 1
+
+        $ifaces = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue
+        foreach ($i in $ifaces) {
+            Set-Reg $i.PSPath "TcpAckFrequency" 1
+            Set-Reg $i.PSPath "TCPNoDelay" 1
+            Set-Reg $i.PSPath "TcpDelAckTicks" 0
+        }
+
+        ipconfig /flushdns | Out-Null
+        Write-Step "Red ajustada. Si empeora online, ejecuta -Restore." "WARN"
+    }
+
+    # ================== SERVICIOS ==================
+    Write-Step "Ajustando servicios no esenciales..."
+
+    $svc = @{
+        "DiagTrack"          = "Disabled"
+        "dmwappushservice"   = "Disabled"
+        "MapsBroker"         = "Disabled"
+        "RetailDemo"         = "Disabled"
+        "RemoteRegistry"     = "Disabled"
+        "XblAuthManager"     = "Manual"
+        "XblGameSave"        = "Manual"
+        "XboxNetApiSvc"      = "Manual"
+        "XboxGipSvc"         = "Manual"
+    }
+
+    if ($Mode -ne 'Balanced') {
+        $svc["WSearch"] = "Disabled"
+        $svc["SysMain"] = "Disabled"
+    }
+
+    if ($Mode -eq 'Extreme') {
+        $svc["PcaSvc"] = "Manual"
+    }
+
+    foreach ($name in $svc.Keys) {
+        $s = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($s) {
+            Set-Service -Name $name -StartupType $svc[$name] -ErrorAction SilentlyContinue
+            Write-Step "Servicio $name -> $($svc[$name])"
+        }
+    }
+
+    # ================== TAREAS PROGRAMADAS ==================
+    Write-Step "Desactivando tareas de telemetría y mantenimiento pesado..."
+
+    $tasks = @(
+        @("\Microsoft\Windows\Application Experience\", "Microsoft Compatibility Appraiser"),
+        @("\Microsoft\Windows\Application Experience\", "ProgramDataUpdater"),
+        @("\Microsoft\Windows\Application Experience\", "StartupAppTask"),
+        @("\Microsoft\Windows\Customer Experience Improvement Program\", "Consolidator"),
+        @("\Microsoft\Windows\Customer Experience Improvement Program\", "UsbCeip"),
+        @("\Microsoft\Windows\DiskDiagnostic\", "Microsoft-Windows-DiskDiagnosticDataCollector"),
+        @("\Microsoft\Windows\Feedback\Siuf\", "DmClient"),
+        @("\Microsoft\Windows\Feedback\Siuf\", "DmClientOnScenarioDownload"),
+        @("\Microsoft\Windows\Maintenance\", "WinSAT"),
+        @("\Microsoft\Windows\Windows Error Reporting\", "QueueReporting")
+    )
+
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        foreach ($t in $tasks) {
+            $path = $t[0]
+            $name = $t[1]
+            $task = Get-ScheduledTask -TaskPath $path -TaskName $name -ErrorAction SilentlyContinue
+            if ($task) {
+                Disable-ScheduledTask -TaskPath $path -TaskName $name -ErrorAction SilentlyContinue | Out-Null
+                Write-Step "Tarea desactivada: $path$name"
+            }
+        }
+    }
+
+    # ================== DEBLOAT OPCIONAL ==================
+    if ($Debloat) {
+        Write-Step "Aplicando debloat de apps no esenciales..." "WARN"
+
+        $apps = @(
+            "Microsoft.BingNews",
+            "Microsoft.BingWeather",
+            "Microsoft.GetHelp",
+            "Microsoft.Getstarted",
+            "Microsoft.MicrosoftOfficeHub",
+            "Microsoft.MicrosoftSolitaireCollection",
+            "Microsoft.People",
+            "Microsoft.SkypeApp",
+            "Microsoft.Todos",
+            "Microsoft.WindowsFeedbackHub",
+            "Microsoft.ZuneMusic",
+            "Microsoft.ZuneVideo",
+            "Microsoft.YourPhone",
+            "MicrosoftTeams",
+            "Clipchamp.Clipchamp",
+            "Microsoft.MixedReality.Portal"
+        )
+
+        $removed = @()
+
+        foreach ($app in $apps) {
+            $pkgs = Get-AppxPackage -Name $app -ErrorAction SilentlyContinue
+            foreach ($pkg in $pkgs) {
+                if ($pkg) {
+                    Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue
+                    $removed += $pkg.PackageFullName
+                    Write-Step "Appx eliminada: $($pkg.Name)" "WARN"
+                }
+            }
+        }
+
+        if ($removed.Count -gt 0) {
+            $removed | Out-File (Join-Path $script:backupDir 'removed_appx.txt') -Encoding UTF8
+        }
+    }
+
+    # ================== LIMPIEZA ==================
+    if ($Clean) {
+        Write-Step "Limpiando temporales, cache y reciclaje..."
+
+        $temps = @(
+            $env:TEMP,
+            $env:LOCALAPPDATA + "\Temp",
+            "$env:WINDIR\Temp",
+            "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"
+        )
+
+        foreach ($t in ($temps | Sort-Object -Unique)) {
+            if (Test-Path $t) {
+                Get-ChildItem -LiteralPath $t -Force -ErrorAction SilentlyContinue |
+                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+        ipconfig /flushdns | Out-Null
+        Write-Step "Limpieza completada." "OK"
+    }
+
+    # ================== HVCI / VBS SOLO CON RIESGO ACEPTADO ==================
+    if ($DisableHVCI -and $IUnderstandRisks) {
+        Write-Step "Desactivando HVCI/VBS. Riesgo de seguridad. Requiere reinicio." "WARN"
+
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" "Enabled" 0
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" "EnableVirtualizationBasedSecurity" 0
+        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" "RequirePlatformSecurityFeatures" 0
+
+        bcdedit /set hypervisorlaunchtype off | Out-Null
+    }
+
+    Write-Step "Optimización aplicada. Reinicia antes de jugar." "OK"
+    Write-Step "Backup guardado en: $script:backupDir" "OK"
+
+    if ($Mode -eq 'Extreme') {
+        Write-Step "Modo Extreme activo. Controla temperatura con HWiNFO64. Si hay throttling, baja a Aggressive." "WARN"
+    }
+}
+
+function Restore-Optimizer {
+    $dir = $BackupPath
+
+    if (-not $dir) {
+        $last = Join-Path $root 'last_backup.txt'
+        if (Test-Path $last) {
+            $dir = (Get-Content $last -Raw).Trim()
+        }
+    }
+
+    if (-not $dir -or -not (Test-Path $dir)) {
+        Write-Step "No se encontró backup. Usa -BackupPath." "ERR"
+        return
+    }
+
+    Write-Step "Restaurando desde $dir..." "WARN"
+
+    Uninstall-WatchTask | Out-Null
+
+    # Registro
+    Get-ChildItem -Path $dir -Filter '*.reg' -File | ForEach-Object {
+        reg import "$($_.FullName)" | Out-Null
+    }
+
+    # Servicios
+    $svcCsv = Join-Path $dir 'services.csv'
+    if (Test-Path $svcCsv) {
+        Import-Csv $svcCsv | ForEach-Object {
+            $name = $_.Name
+            $start = $_.StartType
+            if ($start -eq 'AutomaticDelayedStart') { $start = 'Automatic' }
+            if ($start -in @('Automatic','Manual','Disabled')) {
+                Set-Service -Name $name -StartupType $start -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Tareas programadas
+    $taskCsv = Join-Path $dir 'scheduled_tasks.csv'
+    if (Test-Path $taskCsv) {
+        Import-Csv $taskCsv | ForEach-Object {
+            $path = $_.TaskPath
+            $name = $_.TaskName
+            $state = $_.State
+            $task = Get-ScheduledTask -TaskPath $path -TaskName $name -ErrorAction SilentlyContinue
+            if ($task) {
+                if ($state -in @('Ready','Running')) {
+                    Enable-ScheduledTask -TaskPath $path -TaskName $name -ErrorAction SilentlyContinue | Out-Null
+                } elseif ($state -eq 'Disabled') {
+                    Disable-ScheduledTask -TaskPath $path -TaskName $name -ErrorAction SilentlyContinue | Out-Null
+                }
+            }
+        }
+    }
+
+    # Plan de energía
+    $powerFile = Join-Path $dir 'power_plan.txt'
+    if (Test-Path $powerFile) {
+        $txt = Get-Content $powerFile -Raw
+        if ($txt -match '([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})') {
+            powercfg /setactive $matches[1] | Out-Null
+        } else {
+            powercfg /setactive SCHEME_BALANCED | Out-Null
+        }
+    } else {
+        powercfg /setactive SCHEME_BALANCED | Out-Null
+    }
+
+    # bcdedit
+    $bcdFile = Join-Path $dir 'bcdedit.txt'
+    if (Test-Path $bcdFile) {
+        $bcd = Get-Content $bcdFile -Raw
+        if ($bcd -match 'hypervisorlaunchtype\s+(\w+)') {
+            $hl = $matches[1]
+            if ($hl -eq 'Off') {
+                bcdedit /set hypervisorlaunchtype off | Out-Null
+            } else {
+                bcdedit /set hypervisorlaunchtype auto | Out-Null
+            }
+        }
+    }
+
+    # Quitar exclusiones Defender de CS2
+    foreach ($exe in Get-CS2Exes) {
+        Remove-MpPreference -ExclusionPath $exe -ErrorAction SilentlyContinue
+    }
+
+    # Quitar entradas de CS2 creadas por el optimizador
+    $gpuKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+    $layerKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
+    foreach ($key in @($gpuKey, $layerKey)) {
+        if (Test-Path $key) {
+            (Get-Item $key).Property |
+                Where-Object { $_ -like '*cs2.exe*' } |
+                ForEach-Object {
+                    Remove-ItemProperty -Path $key -Name $_ -ErrorAction SilentlyContinue
+                }
+        }
+    }
+
+    # Nota de apps eliminadas
+    $removed = Join-Path $dir 'removed_appx.txt'
+    if (Test-Path $removed) {
+        Write-Step "Apps eliminadas (reinstala desde Microsoft Store si las necesitas):" "WARN"
+        Get-Content $removed | ForEach-Object {
+            Write-Step "  $_" "WARN"
+        }
+    }
+
+    Write-Step "Restauración completada. Reinicia el equipo." "OK"
+}
+
+if ($Apply -and $Restore) {
+    Write-Step "Usa -Apply o -Restore, no ambos." "ERR"
+    exit 1
+}
+
+if ($DisableHVCI -and -not $IUnderstandRisks) {
+    Write-Step "Para -DisableHVCI debes añadir -IUnderstandRisks. Abortando." "ERR"
+    exit 1
+}
+
+if ($Hags -and $NoHags) {
+    Write-Step "No uses -Hags y -NoHags a la vez." "ERR"
+    exit 1
+}
+
+if ($UninstallWatchTask) {
+    Uninstall-WatchTask
+}
+
+if ($InstallWatchTask) {
+    Install-WatchTask
+}
+
+if ($Restore) {
+    Restore-Optimizer
+}
+elseif ($Apply) {
+    Apply-Optimizer
+}
+elseif (-not $InstallWatchTask -and -not $UninstallWatchTask) {
+    Write-Host @"
+CS2 MAX PERFORMANCE v2.0
+
+Uso recomendado:
+  .\CS2-MaxPerformance-v2.ps1 -Apply -Mode Aggressive -CreateRestorePoint -Clean
+  .\CS2-MaxPerformance-v2.ps1 -Apply -Mode Extreme -CreateRestorePoint -Clean -Debloat -NetworkTweaks -InstallWatchTask
+
+Opciones:
+  -Mode Balanced|Aggressive|Extreme
+  -CreateRestorePoint
+  -Clean
+  -Debloat
+  -NetworkTweaks
+  -DefenderExclusion
+  -Hags
+  -NoHags
+  -DisableHVCI -IUnderstandRisks
+  -InstallWatchTask
+  -UninstallWatchTask
+  -Restore
+  -BackupPath "C:\ProgramData\CS2MaxPerformance\Backup_..."
+
+Restaurar:
+  .\CS2-MaxPerformance-v2.ps1 -Restore
+
+Notas:
+  - Extreme desactiva hibernación y limita C-States. Vigila temperaturas.
+  - Debloat elimina apps de usuario. La restauración no las reinstala automáticamente.
+  - No desactiva Defender, Firewall, Windows Update ni VAC.
+"@ -ForegroundColor Yellow
+}
+```
+
+---
+
+## 2. Comandos recomendados
+
+### Primer pase, agresivo pero controlado
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\CS2-MaxPerformance-v2.ps1 -Apply -Mode Aggressive -CreateRestorePoint -Clean
+```
+
+Reinicia.
+
+### Si quieres exprimir más y aceptas más calor/consumo
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -Apply -Mode Extreme -CreateRestorePoint -Clean -Debloat -NetworkTweaks -InstallWatchTask
+```
+
+Si quieres probar **HAGS**:
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -Apply -Mode Extreme -CreateRestorePoint -Clean -Hags
+```
+
+Si notas stutter con HAGS, prueba al contrario:
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -Apply -Mode Extreme -NoHags
+```
+
+### Watchdog de prioridad para CS2
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -InstallWatchTask
+```
+
+Quitarlo:
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -UninstallWatchTask
+```
+
+### Restaurar todo
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -Restore
+```
+
+Si guardaste backups antiguos:
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -Restore -BackupPath "C:\ProgramData\CS2MaxPerformance\Backup_20240101_120000"
+```
+
+### Desactivar HVCI/VBS solo si sabes lo que haces
+
+Esto reduce seguridad y puede afectar WSL, Docker, Sandbox, emuladores, etc.
+
+```powershell
+.\CS2-MaxPerformance-v2.ps1 -Apply -Mode Extreme -DisableHVCI -IUnderstandRisks
+```
+
+---
+
+## 3. Configuración de CS2 para tu PN64
+
+### Opciones de lanzamiento en Steam
+
+```text
+-novid -high -dx11 -fullscreen -w 1280 -h 720 -refresh 75
+```
+
+Máximo absoluto de FPS:
+
+```text
+-novid -high -dx11 -fullscreen -w 1024 -h 768 -refresh 75
+```
+
+Cambia `75` por `60`, `120` o `144` según tu monitor real.
+
+Notas:
+- Si notas stutter, quita `-high`.
+- No uses `-threads` en CS2.
+- No uses `-allow_third_party_software` salvo necesidad real.
+- No modifiques archivos del juego ni uses cheats/bypasses de VAC.
+
+### Ajustes dentro de CS2
+
+**Vídeo:**
+- Pantalla completa
+- Resolución 1280x720 o 1024x768
+- V-Sync: Off
+- FSR: Performance
+- Dynamic Resolution: Off
+- Multicore Rendering: On
+
+**Avanzado:**
+- Global Shadow Quality: Low
+- Model / Texture Detail: Low
+- Texture Filtering: Bilinear / 2x
+- Shader Detail: Low
+- Particle Detail: Low
+- Ambient Occlusion: Disabled
+- High Dynamic Range: Performance
+- MSAA: Disabled
+- CMAA: Disabled
+- Boost Player Contrast: Off si buscas FPS puro
+
+**Opcional:** `autoexec.cfg` en:
+
+`...\Counter-Strike Global Offensive\game\csgo\cfg\autoexec.cfg`
+
+```cfg
+fps_max 0
+engine_no_focus_sleep 0
+```
+
+Si el mini PC se calienta demasiado, prueba `fps_max 60` o `fps_max 75`. A veces es mejor 75 estables que picos de 100 y bajones a 45.
+
+---
+
+## 4. Extra agresivo pero manual
+
+Estos no los automatizaría sin que sepas lo que haces:
+
+- **BIOS/MyASUS:** última BIOS, chipset, Intel Graphics, modo Performance/Turbo, ventilador en Performance.
+- **Intel Graphics Command Center:** modo Rendimiento, desactivar mejoras visuales, AA, filtros, escalado extra.
+- **Windows → Gráficos:** `cs2.exe` en Alto rendimiento.
+- **Cerrar antes de jugar:** Chrome/Edge con muchas pestañas, Discord overlay, OneDrive, Teams, MyASUS en segundo plano, RGB/iCUE, grabadores.
+- **Ethernet**, no Wi-Fi.
+- **HWiNFO64:** vigila temperatura CPU/iGPU, throttling, frecuencia. Si pasas de 85–90 °C sostenidos, baja `fps_max` o resolución.
+- No uses “limpiadores de RAM”, desfragmentadores de SSD, limpiadores de registro agresivos ni “game boosters” de pago.
+
+---
+
+## 5. Lo que no haría ni aunque pidas “máximo”
+
+- No desactivar Defender, Firewall, Windows Update o VAC.
+- No apagar el pagefile.
+- No poner CS2 en prioridad `Realtime`.
+- No usar `bcdedit` raros de HPET/timer sin saber.
+- No borrar archivos de CS2 para “optimizar”.
+- No usar `-threads` ni cvars antiguas de CS:GO.
+- No desactivar mitigaciones de CPU “a lo loco”; en Windows 11 moderno ganarás poco y perderás estabilidad/seguridad.
+
+Con tu equipo, el objetivo real es **mínimos estables, sin throttling y con la iGPU lo más despejada posible**, no perseguir 300 FPS imposibles.
